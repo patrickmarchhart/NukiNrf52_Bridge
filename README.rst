@@ -1,61 +1,136 @@
-.. zephyr:code-sample:: ble_central
-   :name: Central
-   :relevant-api: bluetooth
-
-   Implement basic Bluetooth LE Central role functionality
-   (scanning and connecting).
+Nuki nRF52 Bridge
+##################
 
 Overview
 ********
 
-This application demonstrates basic Bluetooth LE Central role functionality
-by scanning for other Bluetooth LE devices and establishing a connection
-to the first one with a strong enough signal.
+Firmware for an nRF52840 (nRF Connect SDK / Zephyr) that turns the board into
+a standalone Bluetooth LE controller for a Nuki Smart Lock (1st-4th
+Generation). It performs the full Nuki pairing handshake itself (no phone
+app / Nuki Bridge required), and can then lock/unlock/unlatch/calibrate the
+lock and read back its state (lock state, battery, door sensor).
+
+Two ways to control it:
+
+* An interactive ``nuki`` shell command on the console UART (``uart0``), for
+  manual use and testing.
+* A dedicated, machine-readable line protocol on a second UART (``uart1``)
+  for integrating with an external home-automation controller (built for and
+  tested against a custom Loxone module) - see
+  `LOXONE_UART_PROTOCOL.md <LOXONE_UART_PROTOCOL.md>`_ for the full command
+  reference.
 
 Core features
 *************
 
-Scanning for devices
-====================
+Pairing
+=======
 
-The application initiates a passive scan to detect nearby Bluetooth LE devices.
-It specifically looks for devices that have a signal strength greater
-than -50dBm. This threshold helps the app filter out weaker signals,
-ensuring it only interacts with devices that are within a reasonable RSSI
-range for communication.
+``nuki pair`` (shell) or ``PAIR`` (UART protocol) runs the Nuki BLE pairing
+handshake (Curve25519 key exchange, HSalsa20/Salsa20/Poly1305 encryption,
+HMAC-SHA256 authentication - see ``src/nuki_crypto.c`` and
+``src/nuki_pairing.c``) against a lock in pairing mode (button held ~5 s).
+The resulting authorization ID and shared key are persisted via Zephyr's
+``settings`` subsystem and survive a reboot.
 
-Connection handling
-===================
+Connect-on-demand
+==================
 
-1. The Central scans for Peripheral devices and if it finds a Peripheral
-   which has a signal strength higher than -50dBm, an attempt to establish
-   LE connection is made.
-2. If the connection is successful, the Central initiates disconnect to
-   the Peripheral and then restarts the scan.
-3. If there are no connections, the Central keeps scanning continuously.
+Most Nuki locks only accept a single BLE connection at a time. To avoid
+permanently occupying that slot (which would block the official Nuki app),
+this firmware connects only for the duration of one operation - pairing,
+a status read, or a lock action - and disconnects immediately afterwards
+(see ``src/nuki_app.c``).
 
-The sample is used to demonstrate the Central mode capabilities of Bluetooth LE and
-hence a disconnect is issued right immediately after establishing a connection with
-a Peripheral, allowing the Central to resume scanning for other devices.
+Background status cache
+========================
+
+A background timer polls the lock's state periodically (every 15 minutes by
+default, matching the official Nuki Bridge's own default poll interval) and
+caches the result. A ``STATE``/``nuki state`` query then normally answers
+from that cache instead of paying for a multi-second BLE round trip; the
+response includes the cache's age so a caller can judge freshness.
+
+Loxone UART protocol
+=====================
+
+A second, dedicated UART (``uart1``, pins configurable via
+``boards/nrf52840dk_nrf52840.overlay``) speaks a simple text-line protocol
+(``STATUS``, ``PAIR``, ``STATE``, ``LOCK``, ``UNLOCK``, ``UNLATCH``,
+``CALIBRATE <pin>``, with ``OK ...`` / ``ERR <errno> <CODE>`` responses),
+kept separate from the human-oriented shell/log console on ``uart0`` so an
+external controller doesn't have to parse shell prompts or log lines. See
+`LOXONE_UART_PROTOCOL.md <LOXONE_UART_PROTOCOL.md>`_.
 
 Requirements
 ************
 
-* BlueZ running on the host, or
-* A board with Bluetooth LE support
+* nRF Connect SDK v3.4.0 / Zephyr 4.4.0
+* A board with Bluetooth LE support; developed and tested on
+  ``nrf52840dk/nrf52840``
+* A Nuki Smart Lock (1st-4th Generation)
 
 Building and running
-********************
+*********************
 
-Build and flash the sample as follows, replacing board_name with your
-target board:
+.. code-block:: console
 
-.. zephyr-app-commands::
-   :zephyr-app: samples/bluetooth/central
-   :board: board_name
-   :goals: build flash
-   :compact:
+   west build -b nrf52840dk/nrf52840 .
+   west flash
 
-To test Central's scanning functionality, either flash the :zephyr:code-sample:`ble_peripheral`
-sample on a second compatible board or use an off-the-shelf Bluetooth LE enabled
-device that can act as a Peripheral (eg. smartphone, smartwatch, etc.).
+Usage (shell, on uart0)
+========================
+
+.. code-block:: console
+
+   uart:~$ nuki status
+   uart:~$ nuki pair       # hold the lock's button for ~5s first
+   uart:~$ nuki state
+   uart:~$ nuki lock
+   uart:~$ nuki unlock
+   uart:~$ nuki unlatch
+   uart:~$ nuki calibrate <security-pin>
+
+Usage (Loxone / machine protocol, on uart1)
+=============================================
+
+115200 8N1 by default (see the board overlay). Example session:
+
+.. code-block:: text
+
+   > STATUS
+   < OK PAIRED=1 CONNECTED=0 READY=0
+   > STATE
+   < OK LOCK_STATE=3 LOCK_STATE_NAME=unlocked BATTERY=87 CRITICAL=0 ... AGE_S=42
+   > LOCK
+   < OK LOCKED
+
+Full command/error reference: `LOXONE_UART_PROTOCOL.md <LOXONE_UART_PROTOCOL.md>`_.
+
+Tests
+*****
+
+``tests/nuki_crypto`` contains a Twister test case for the crypto primitives
+(``dh1``/``kdf1``/``h1``/``e1``/``d1``/CRC16) in ``src/nuki_crypto.c``,
+checked against vectors from the official Nuki BLE API documentation.
+
+Project layout
+**************
+
+.. code-block:: text
+
+   src/
+     nuki_crypto.c/h     Curve25519/HSalsa20/Salsa20/Poly1305/HMAC-SHA256/CRC16 primitives
+     nuki_protocol.c/h   Nuki BLE GATT UUIDs, command IDs, frame build/parse
+     nuki_storage.c/h    Persisted pairing data (settings/NVS)
+     nuki_transport.c/h  GATT read/write/indication plumbing for one characteristic
+     nuki_pairing.c/h    The pairing handshake state machine
+     nuki_command.c/h    Encrypted state/lock-action/calibrate commands
+     nuki_app.c/h        Scan/connect/discover orchestration, connect-on-demand,
+                          background status cache, top-level public API
+     nuki_shell.c        Interactive "nuki ..." shell commands (uart0)
+     nuki_uart_proto.c/h Loxone machine protocol (uart1)
+     main.c
+   boards/
+     nrf52840dk_nrf52840.overlay   Enables/pinmuxes uart1 for the Loxone protocol
+   tests/nuki_crypto/               Twister test for the crypto primitives
