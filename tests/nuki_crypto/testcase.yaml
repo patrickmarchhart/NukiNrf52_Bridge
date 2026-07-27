@@ -1,0 +1,4 @@
+tests:
+  nuki.crypto:
+    platform_allow: native_sim
+    tags: crypto
