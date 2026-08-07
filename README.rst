@@ -55,12 +55,14 @@ Loxone UART protocol
 =====================
 
 A second, dedicated UART (``uart1``, pins configurable via
-``boards/nrf52840dk_nrf52840.overlay``) speaks a simple text-line protocol
-(``STATUS``, ``PAIR``, ``STATE``, ``LOCK``, ``UNLOCK``, ``UNLATCH``,
-``CALIBRATE <pin>``, with ``OK ...`` / ``ERR <errno> <CODE>`` responses),
-kept separate from the human-oriented shell/log console on ``uart0`` so an
-external controller doesn't have to parse shell prompts or log lines. See
-`LOXONE_UART_PROTOCOL.md <LOXONE_UART_PROTOCOL.md>`_.
+``boards/nrf52840dk_nrf52840.overlay``) speaks a binary frame protocol -
+every request and response is a fixed C struct (see ``nuki_uart_proto.h``),
+wrapped in a ``SOF | CMD | LEN | PAYLOAD`` frame (no CRC - a short, direct
+point-to-point link), with distinct SOF bytes for requests (``0xA5``) and
+responses (``0x5A``) so a captured frame's direction is obvious from its
+first byte - kept separate from the human-oriented shell/log console on
+``uart0``. See `LOXONE_UART_PROTOCOL.md <LOXONE_UART_PROTOCOL.md>`_ for the
+full byte-level reference.
 
 Requirements
 ************
@@ -94,16 +96,14 @@ Usage (shell, on uart0)
 Usage (Loxone / machine protocol, on uart1)
 =============================================
 
-115200 8N1 by default (see the board overlay). Example session:
+115200 8N1 by default (see the board overlay). A binary ``SOF | CMD | LEN |
+PAYLOAD`` frame in each direction, e.g. requesting ``STATE`` (``CMD`` ``3``,
+no payload) and getting back a ``struct nuki_uart_resp_state``:
 
 .. code-block:: text
 
-   > STATUS
-   < OK PAIRED=1 CONNECTED=0 READY=0
-   > STATE
-   < OK LOCK_STATE=3 LOCK_STATE_NAME=unlocked BATTERY=87 CRITICAL=0 ... AGE_S=42
-   > LOCK
-   < OK LOCKED
+   > A5 03 00
+   < 5A 03 15 00 00 00 00 03 57 00 03 EA 07 08 07 0E 02 0A 00 00 2A 00 00 00
 
 Full command/error reference: `LOXONE_UART_PROTOCOL.md <LOXONE_UART_PROTOCOL.md>`_.
 

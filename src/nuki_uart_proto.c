@@ -1,29 +1,21 @@
-/* nuki_uart_proto.c - see nuki_uart_proto.h.
+/* nuki_uart_proto.c - see nuki_uart_proto.h for the wire format.
  *
- * Protocol (one command per line, newline-terminated, case-insensitive):
- *   STATUS                  -> OK PAIRED=0|1 CONNECTED=0|1 READY=0|1
- *   PAIR                    -> OK PAIRED                | ERR <errno> <code>
- *   STATE                   -> OK LOCK_STATE=<n> LOCK_STATE_NAME=<s> BATTERY=<pct>
- *                               CRITICAL=0|1 DOOR_STATE=<n> DOOR_STATE_NAME=<s>
- *                               YEAR=.. MONTH=.. DAY=.. HOUR=.. MIN=.. SEC=.. TZ=<min>
- *                               AGE_S=<seconds>
- *                               Answered instantly from a cache kept fresh by a
- *                               background poll every ~60s (see nuki_app.c) rather
- *                               than a live BLE read; AGE_S says how stale that
- *                               snapshot is. "ERR -61 NO_DATA_YET" if no poll has
- *                               completed yet (e.g. right after boot).
- *   LOCK / UNLOCK / UNLATCH -> OK LOCKED | OK UNLOCKED | OK UNLATCHED
- *   CALIBRATE <pin>         -> OK CALIBRATED
- * Errors: "ERR <errno> <STABLE_CODE>", e.g. "ERR -2 NOT_PAIRED".
+ * RX side: serial_cb() (UART ISR) runs a small byte-at-a-time state machine
+ * that hunts for SOF, then collects CMD/LEN/PAYLOAD into a struct rx_frame;
+ * once the payload is complete it's handed to nuki_uart_msgq for
+ * nuki_uart_thread_fn() to dispatch. A bogus LEN drops back to hunting for
+ * the next SOF instead of getting stuck waiting for payload bytes that will
+ * never come.
+ *
+ * TX side: send_frame() builds a complete frame in a stack buffer and
+ * writes it out with uart_poll_out() (replies are short and infrequent
+ * enough that a second interrupt-driven TX path isn't worth it).
  */
 #include "nuki_uart_proto.h"
 #include "nuki_app.h"
 #include "nuki_protocol.h"
 
-#include <ctype.h>
 #include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -33,18 +25,32 @@
 LOG_MODULE_REGISTER(nuki_uart_proto, LOG_LEVEL_INF);
 
 #define NUKI_UART_NODE DT_NODELABEL(uart1)
-#define LINE_MAX 64
-#define REPLY_MAX 200
 #define THREAD_STACK_SIZE 2048
 #define THREAD_PRIORITY 7
 
 static const struct device *const uart_dev = DEVICE_DT_GET(NUKI_UART_NODE);
 
-K_MSGQ_DEFINE(nuki_uart_msgq, LINE_MAX, 4, 4);
+/* A fully received request frame, as handed from serial_cb() to
+ * nuki_uart_thread_fn() via nuki_uart_msgq.
+ */
+struct rx_frame {
+	uint8_t cmd;
+	uint8_t len;
+	uint8_t payload[NUKI_UART_MAX_PAYLOAD];
+};
+
+K_MSGQ_DEFINE(nuki_uart_msgq, sizeof(struct rx_frame), 4, 4);
 
 /* Only ever touched from the UART ISR - no locking needed. */
-static char rx_buf[LINE_MAX];
-static size_t rx_buf_pos;
+enum rx_state {
+	RX_WAIT_SOF,
+	RX_WAIT_CMD,
+	RX_WAIT_LEN,
+	RX_WAIT_PAYLOAD,
+};
+static enum rx_state rx_state = RX_WAIT_SOF;
+static struct rx_frame rx_frame;
+static uint8_t rx_payload_pos;
 
 static K_THREAD_STACK_DEFINE(nuki_uart_thread_stack, THREAD_STACK_SIZE);
 static struct k_thread nuki_uart_thread_data;
@@ -59,184 +65,166 @@ static void serial_cb(const struct device *dev, void *user_data)
 	}
 
 	while (uart_fifo_read(dev, &c, 1) == 1) {
-		if (c == '\n' || c == '\r') {
-			if (rx_buf_pos > 0) {
-				rx_buf[rx_buf_pos] = '\0';
-				/* Full queue: message silently dropped. */
-				k_msgq_put(&nuki_uart_msgq, rx_buf, K_NO_WAIT);
-				rx_buf_pos = 0;
+		switch (rx_state) {
+		case RX_WAIT_SOF:
+			if (c == NUKI_UART_FRAME_SOF_REQ) {
+				rx_state = RX_WAIT_CMD;
 			}
-		} else if (rx_buf_pos < sizeof(rx_buf) - 1) {
-			rx_buf[rx_buf_pos++] = (char)c;
+			break;
+		case RX_WAIT_CMD:
+			rx_frame.cmd = c;
+			rx_state = RX_WAIT_LEN;
+			break;
+		case RX_WAIT_LEN:
+			if (c > NUKI_UART_MAX_PAYLOAD) {
+				/* Bogus length - resync on the next SOF. */
+				rx_state = RX_WAIT_SOF;
+				break;
+			}
+			rx_frame.len = c;
+			rx_payload_pos = 0;
+			if (rx_frame.len == 0) {
+				/* Full queue: frame silently dropped. */
+				k_msgq_put(&nuki_uart_msgq, &rx_frame, K_NO_WAIT);
+				rx_state = RX_WAIT_SOF;
+			} else {
+				rx_state = RX_WAIT_PAYLOAD;
+			}
+			break;
+		case RX_WAIT_PAYLOAD:
+			rx_frame.payload[rx_payload_pos++] = c;
+			if (rx_payload_pos == rx_frame.len) {
+				/* Full queue: frame silently dropped. */
+				k_msgq_put(&nuki_uart_msgq, &rx_frame, K_NO_WAIT);
+				rx_state = RX_WAIT_SOF;
+			}
+			break;
 		}
-		/* else: characters beyond the line buffer are dropped. */
 	}
 }
 
-static void send_line(const char *line)
+static void send_frame(uint8_t cmd, const void *payload, uint8_t len)
 {
-	for (size_t i = 0; line[i] != '\0'; i++) {
-		uart_poll_out(uart_dev, line[i]);
-	}
-	uart_poll_out(uart_dev, '\n');
-}
+	uint8_t out[1 + 2 + NUKI_UART_MAX_PAYLOAD];
+	size_t n = 0;
 
-static const char *err_code(int err)
-{
-	switch (err) {
-	case -ENOTCONN:
-		return "NOT_CONNECTED";
-	case -ENOENT:
-		return "NOT_PAIRED";
-	case -ENODATA:
-		return "NO_DATA_YET";
-	case -ETIMEDOUT:
-	case -EAGAIN:
-		return "TIMEOUT";
-	case -EBADMSG:
-		return "BADMSG";
-	case -ENOTSUP:
-		return "UNSUPPORTED";
-	case -EINVAL:
-		return "INVALID_ARGS";
-	default:
-		return "ERROR";
+	out[n++] = NUKI_UART_FRAME_SOF_RESP;
+	out[n++] = cmd;
+	out[n++] = len;
+	if (len) {
+		memcpy(&out[n], payload, len);
+		n += len;
+	}
+
+	for (size_t i = 0; i < n; i++) {
+		uart_poll_out(uart_dev, out[i]);
 	}
 }
 
-static void reply_ok(const char *details)
+static void send_simple_response(uint8_t cmd, int32_t rc)
 {
-	char line[REPLY_MAX];
+	struct nuki_uart_resp_simple resp = {.rc = rc};
 
-	if (details && details[0] != '\0') {
-		snprintf(line, sizeof(line), "OK %s", details);
-	} else {
-		snprintf(line, sizeof(line), "OK");
-	}
-	send_line(line);
-}
-
-static void reply_err(int err)
-{
-	char line[48];
-
-	snprintf(line, sizeof(line), "ERR %d %s", err, err_code(err));
-	send_line(line);
+	send_frame(cmd, &resp, sizeof(resp));
 }
 
 static void handle_status(void)
 {
-	char details[64];
+	struct nuki_uart_resp_status resp = {
+		.rc = 0,
+		.paired = nuki_app_is_paired() ? 1 : 0,
+		.connected = nuki_app_is_connected() ? 1 : 0,
+		.ready = nuki_app_is_ready() ? 1 : 0,
+	};
 
-	snprintf(details, sizeof(details), "PAIRED=%d CONNECTED=%d READY=%d",
-		 nuki_app_is_paired() ? 1 : 0, nuki_app_is_connected() ? 1 : 0,
-		 nuki_app_is_ready() ? 1 : 0);
-	reply_ok(details);
+	send_frame(NUKI_UART_CMD_STATUS, &resp, sizeof(resp));
 }
 
 static void handle_pair(void)
 {
 	int err = nuki_app_pair();
 
-	if (err) {
-		reply_err(err);
-		return;
-	}
-	reply_ok("PAIRED");
+	send_simple_response(NUKI_UART_CMD_PAIR, err);
 }
 
 static void handle_state(void)
 {
+	struct nuki_uart_resp_state resp = {0};
 	struct nuki_keyturner_state state;
-	char details[REPLY_MAX - 3];
 	int32_t age_sec;
-	/* Served from the background poller's cache (see nuki_app_get_cached_state())
-	 * instead of a live BLE read, so this answers instantly.
+	/* Served from the background poller's cache (see
+	 * nuki_app_get_cached_state()) instead of a live BLE read, so this
+	 * answers instantly.
 	 */
 	int err = nuki_app_get_cached_state(&state, &age_sec);
 
-	if (err) {
-		reply_err(err);
-		return;
+	resp.rc = err;
+	if (!err) {
+		resp.lock_state = state.lock_state;
+		resp.battery_percent = state.battery_percent;
+		resp.critical_battery = state.critical_battery ? 1 : 0;
+		resp.door_sensor_state = state.door_sensor_state;
+		resp.year = state.year;
+		resp.month = state.month;
+		resp.day = state.day;
+		resp.hour = state.hour;
+		resp.minute = state.minute;
+		resp.second = state.second;
+		resp.timezone_offset_min = state.timezone_offset_min;
+		resp.age_sec = age_sec;
 	}
-
-	snprintf(details, sizeof(details),
-		 "LOCK_STATE=%u LOCK_STATE_NAME=%s BATTERY=%u CRITICAL=%d DOOR_STATE=%u "
-		 "DOOR_STATE_NAME=%s YEAR=%u MONTH=%u DAY=%u HOUR=%u MIN=%u SEC=%u TZ=%d AGE_S=%d",
-		 state.lock_state, nuki_lock_state_to_str(state.lock_state),
-		 state.battery_percent, state.critical_battery ? 1 : 0, state.door_sensor_state,
-		 nuki_door_sensor_state_to_str(state.door_sensor_state), state.year, state.month,
-		 state.day, state.hour, state.minute, state.second, state.timezone_offset_min,
-		 age_sec);
-	reply_ok(details);
+	send_frame(NUKI_UART_CMD_STATE, &resp, sizeof(resp));
 }
 
-static void handle_lock_action(uint8_t action, const char *ok_word)
+static void handle_lock_action(uint8_t action, uint8_t cmd)
 {
 	int err = nuki_app_lock_action(action);
 
-	if (err) {
-		reply_err(err);
-		return;
-	}
-	reply_ok(ok_word);
+	send_simple_response(cmd, err);
 }
 
-static void handle_calibrate(const char *arg)
+static void handle_calibrate(const struct rx_frame *frame)
 {
-	char *endptr;
-	unsigned long pin;
+	struct nuki_uart_req_calibrate req;
 	int err;
 
-	if (!arg) {
-		reply_err(-EINVAL);
+	if (frame->len != sizeof(req)) {
+		send_simple_response(NUKI_UART_CMD_CALIBRATE, -EINVAL);
 		return;
 	}
+	memcpy(&req, frame->payload, sizeof(req));
 
-	pin = strtoul(arg, &endptr, 10);
-	if (*endptr != '\0' || pin > 0xFFFF) {
-		reply_err(-EINVAL);
-		return;
-	}
-
-	err = nuki_app_calibrate((uint16_t)pin);
-	if (err) {
-		reply_err(err);
-		return;
-	}
-	reply_ok("CALIBRATED");
+	err = nuki_app_calibrate(req.pin);
+	send_simple_response(NUKI_UART_CMD_CALIBRATE, err);
 }
 
-static void dispatch_line(char *line)
+static void dispatch_frame(const struct rx_frame *frame)
 {
-	char *saveptr;
-	char *cmd = strtok_r(line, " \t", &saveptr);
-	char *arg = strtok_r(NULL, " \t", &saveptr);
-
-	if (!cmd) {
-		return;
-	}
-
-	for (char *p = cmd; *p != '\0'; p++) {
-		*p = (char)toupper((unsigned char)*p);
-	}
-
-	if (strcmp(cmd, "STATUS") == 0) {
+	switch (frame->cmd) {
+	case NUKI_UART_CMD_STATUS:
 		handle_status();
-	} else if (strcmp(cmd, "PAIR") == 0) {
+		break;
+	case NUKI_UART_CMD_PAIR:
 		handle_pair();
-	} else if (strcmp(cmd, "STATE") == 0) {
+		break;
+	case NUKI_UART_CMD_STATE:
 		handle_state();
-	} else if (strcmp(cmd, "LOCK") == 0) {
-		handle_lock_action(NUKI_LOCK_ACTION_LOCK, "LOCKED");
-	} else if (strcmp(cmd, "UNLOCK") == 0) {
-		handle_lock_action(NUKI_LOCK_ACTION_UNLOCK, "UNLOCKED");
-	} else if (strcmp(cmd, "UNLATCH") == 0) {
-		handle_lock_action(NUKI_LOCK_ACTION_UNLATCH, "UNLATCHED");
-	} else if (strcmp(cmd, "CALIBRATE") == 0) {
-		handle_calibrate(arg);
-	} else {
-		send_line("ERR -22 UNKNOWN_COMMAND");
+		break;
+	case NUKI_UART_CMD_LOCK:
+		handle_lock_action(NUKI_LOCK_ACTION_LOCK, NUKI_UART_CMD_LOCK);
+		break;
+	case NUKI_UART_CMD_UNLOCK:
+		handle_lock_action(NUKI_LOCK_ACTION_UNLOCK, NUKI_UART_CMD_UNLOCK);
+		break;
+	case NUKI_UART_CMD_UNLATCH:
+		handle_lock_action(NUKI_LOCK_ACTION_UNLATCH, NUKI_UART_CMD_UNLATCH);
+		break;
+	case NUKI_UART_CMD_CALIBRATE:
+		handle_calibrate(frame);
+		break;
+	default:
+		send_simple_response(frame->cmd, -EINVAL);
+		break;
 	}
 }
 
@@ -245,10 +233,10 @@ static void nuki_uart_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
-	char line[LINE_MAX];
+	struct rx_frame frame;
 
-	while (k_msgq_get(&nuki_uart_msgq, line, K_FOREVER) == 0) {
-		dispatch_line(line);
+	while (k_msgq_get(&nuki_uart_msgq, &frame, K_FOREVER) == 0) {
+		dispatch_frame(&frame);
 	}
 }
 
@@ -273,6 +261,6 @@ int nuki_uart_proto_init(void)
 			K_NO_WAIT);
 	k_thread_name_set(&nuki_uart_thread_data, "nuki_uart_proto");
 
-	LOG_INF("Loxone module UART protocol ready on uart1");
+	LOG_INF("Loxone module UART frame protocol ready on uart1");
 	return 0;
 }
