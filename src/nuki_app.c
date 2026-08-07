@@ -86,7 +86,27 @@ static struct k_mutex g_op_lock;
  */
 #define STATE_POLL_INTERVAL_SEC (15 * 60)
 
-static struct k_work_delayable g_state_poll_work;
+/* If a poll fails (e.g. a transient BLE hiccup like a stalled discovery),
+ * retry sooner instead of leaving the cache stale for the full interval -
+ * but only a bounded number of times, so a persistently unreachable lock
+ * doesn't turn into a tight retry loop.
+ */
+#define STATE_POLL_RETRY_SEC 3
+#define STATE_POLL_MAX_RETRIES 3
+#define STATE_POLL_THREAD_STACK_SIZE 2048
+#define STATE_POLL_THREAD_PRIORITY 7
+
+/* Runs on its own dedicated thread rather than the system workqueue: the
+ * poll blocks for several seconds inside connect_to_lock(), and the system
+ * workqueue is shared with the Bluetooth host's own background work (e.g.
+ * connection housekeeping) - tying it up caused GATT discovery to
+ * occasionally stall for the full connect timeout during a background poll,
+ * even though the exact same operation triggered manually (on the shell's
+ * own thread) never showed the problem.
+ */
+static K_THREAD_STACK_DEFINE(state_poll_thread_stack, STATE_POLL_THREAD_STACK_SIZE);
+static struct k_thread state_poll_thread_data;
+static uint8_t g_state_poll_retries;
 static struct k_mutex g_cache_lock;
 static struct nuki_keyturner_state g_cached_state;
 static bool g_cache_valid;
@@ -517,30 +537,49 @@ static void disconnect_from_lock(void)
 
 /* --- periodic status polling ------------------------------------------- */
 
-static void state_poll_handler(struct k_work *work)
+static void state_poll_thread_fn(void *p1, void *p2, void *p3)
 {
-	ARG_UNUSED(work);
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
 	struct nuki_keyturner_state state;
 	int err;
+	k_timeout_t next;
 
-	/* Only poll once actually paired - otherwise every poll would just
-	 * fail with -ENOENT and spam the log.
-	 */
-	if (nuki_app_is_paired()) {
-		err = nuki_app_get_state(&state);
-		if (!err) {
-			k_mutex_lock(&g_cache_lock, K_FOREVER);
-			g_cached_state = state;
-			g_cache_valid = true;
-			g_cache_uptime_ms = k_uptime_get();
-			k_mutex_unlock(&g_cache_lock);
-			LOG_DBG("background state poll ok");
-		} else {
-			LOG_WRN("background state poll failed (%d)", err);
+	while (1) {
+		next = K_SECONDS(STATE_POLL_INTERVAL_SEC);
+
+		/* Only poll once actually paired - otherwise every poll would
+		 * just fail with -ENOENT and spam the log. Not being paired
+		 * isn't a transient failure, so it doesn't consume a retry.
+		 */
+		if (nuki_app_is_paired()) {
+			LOG_INF("background state poll starting");
+			err = nuki_app_get_state(&state);
+			if (!err) {
+				k_mutex_lock(&g_cache_lock, K_FOREVER);
+				g_cached_state = state;
+				g_cache_valid = true;
+				g_cache_uptime_ms = k_uptime_get();
+				k_mutex_unlock(&g_cache_lock);
+				LOG_INF("background state poll succeeded");
+				g_state_poll_retries = 0;
+			} else if (g_state_poll_retries < STATE_POLL_MAX_RETRIES) {
+				g_state_poll_retries++;
+				LOG_WRN("background state poll failed (%d) - retry %u/%u in %ds",
+					err, g_state_poll_retries, STATE_POLL_MAX_RETRIES,
+					STATE_POLL_RETRY_SEC);
+				next = K_SECONDS(STATE_POLL_RETRY_SEC);
+			} else {
+				LOG_WRN("background state poll failed (%d) - giving up after %u "
+					"retries, next attempt in %d min",
+					err, g_state_poll_retries, STATE_POLL_INTERVAL_SEC / 60);
+				g_state_poll_retries = 0;
+			}
 		}
-	}
 
-	k_work_schedule(&g_state_poll_work, K_SECONDS(STATE_POLL_INTERVAL_SEC));
+		k_sleep(next);
+	}
 }
 
 /* --- public API -------------------------------------------------------------- */
@@ -552,8 +591,11 @@ int nuki_app_init(void)
 	k_mutex_init(&g_op_lock);
 	k_mutex_init(&g_cache_lock);
 	k_work_init_delayable(&g_scan_timeout_work, scan_timeout_handler);
-	k_work_init_delayable(&g_state_poll_work, state_poll_handler);
-	k_work_schedule(&g_state_poll_work, K_SECONDS(STATE_POLL_INTERVAL_SEC));
+
+	k_thread_create(&state_poll_thread_data, state_poll_thread_stack,
+			STATE_POLL_THREAD_STACK_SIZE, state_poll_thread_fn, NULL, NULL, NULL,
+			K_PRIO_COOP(STATE_POLL_THREAD_PRIORITY), 0, K_NO_WAIT);
+	k_thread_name_set(&state_poll_thread_data, "nuki_state_poll");
 	return 0;
 }
 

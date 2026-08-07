@@ -121,7 +121,11 @@ Liefert den zuletzt bekannten Schlosszustand — **aus dem Cache**, den der
 Hintergrund-Poller alle 15 Minuten aktualisiert (siehe `nuki_app.c`,
 `state_poll_handler`; 15 min entspricht dem Standard-Poll-Intervall der
 offiziellen Nuki Bridge). Antwortet dadurch sofort, ohne live per BLE zu
-lesen.
+lesen. Schlägt ein Poll fehl (z. B. transienter BLE-Aussetzer), wird nach
+3 Sekunden erneut versucht, maximal 3-mal in Folge; danach wartet der
+Poller wieder bis zum nächsten regulären 15-Minuten-Slot. Der Cache-Wert
+bleibt bei einem Fehlschlag unverändert (nur `AGE_S` wächst entsprechend
+weiter) — es wird nie ein "kein Wert"-Zustand daraus.
 
 Request: kein Payload.
 
