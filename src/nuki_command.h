@@ -16,9 +16,17 @@ int nuki_command_get_state(struct nuki_transport *usdio, uint32_t auth_id,
 /* Requests a fresh challenge and performs a lock action (see enum
  * nuki_lock_action). app_id must be the same one used during pairing.
  * Blocks until the lock reports Status COMPLETE (or an error/timeout).
+ *
+ * The lock conveniently pushes an intermediate KeyturnerStates update while
+ * processing the action, sparing callers a separate nuki_command_get_state()
+ * round trip. If state_out and got_state are both non-NULL, *got_state is
+ * set to whether one was actually captured (best-effort - not guaranteed on
+ * every action), and *state_out is only filled in that case. Pass NULL for
+ * both if the caller doesn't need this.
  */
 int nuki_command_lock_action(struct nuki_transport *usdio, uint32_t auth_id, uint32_t app_id,
-			      const uint8_t shared_key[NUKI_KEY_LEN], uint8_t action);
+			      const uint8_t shared_key[NUKI_KEY_LEN], uint8_t action,
+			      struct nuki_keyturner_state *state_out, bool *got_state);
 
 /* Requests a fresh challenge and triggers calibration: the lock rotates
  * through its full range once to relearn its mechanical end-stops (same

@@ -10,6 +10,11 @@
  * TX side: send_frame() builds a complete frame in a stack buffer and
  * writes it out with uart_poll_out() (replies are short and infrequent
  * enough that a second interrupt-driven TX path isn't worth it).
+ *
+ * Both sides hex-dump every byte on uart0 (LOG_HEXDUMP_INF, "uart1 RX"/
+ * "uart1 TX") - RX dumps show the raw bytes as received, regardless of
+ * whether they ever form a valid frame, which is the main thing to look at
+ * when debugging a Loxone-side wiring/framing problem.
  */
 #include "nuki_uart_proto.h"
 #include "nuki_app.h"
@@ -25,7 +30,14 @@
 LOG_MODULE_REGISTER(nuki_uart_proto, LOG_LEVEL_INF);
 
 #define NUKI_UART_NODE DT_NODELABEL(uart1)
-#define THREAD_STACK_SIZE 2048
+/* Must be large enough for the same call chain the shell uses for lock
+ * actions (connect_to_lock() -> GATT discovery -> encrypt/decrypt the
+ * response) - the shell needed CONFIG_SHELL_STACK_SIZE=4096 for exactly
+ * this, so match it here (2048 overflowed on the first real LOCK/UNLOCK/
+ * UNLATCH test over uart1 - STATUS/STATE alone never exercised this deep a
+ * call chain since they're served from cache).
+ */
+#define THREAD_STACK_SIZE 4096
 #define THREAD_PRIORITY 7
 
 static const struct device *const uart_dev = DEVICE_DT_GET(NUKI_UART_NODE);
@@ -59,12 +71,22 @@ static void serial_cb(const struct device *dev, void *user_data)
 {
 	ARG_UNUSED(user_data);
 	uint8_t c;
+	/* Every raw byte seen in this ISR burst, logged below regardless of
+	 * whether it ends up forming a valid frame - the single most useful
+	 * thing to see when debugging a Loxone-side wiring/framing problem:
+	 * whether anything arrives at all, and whether it looks right.
+	 */
+	uint8_t rx_debug[32];
+	size_t rx_debug_len = 0;
 
 	if (!uart_irq_update(dev) || !uart_irq_rx_ready(dev)) {
 		return;
 	}
 
 	while (uart_fifo_read(dev, &c, 1) == 1) {
+		if (rx_debug_len < sizeof(rx_debug)) {
+			rx_debug[rx_debug_len++] = c;
+		}
 		switch (rx_state) {
 		case RX_WAIT_SOF:
 			if (c == NUKI_UART_FRAME_SOF_REQ) {
@@ -101,6 +123,10 @@ static void serial_cb(const struct device *dev, void *user_data)
 			break;
 		}
 	}
+
+	if (rx_debug_len) {
+		LOG_HEXDUMP_INF(rx_debug, rx_debug_len, "uart1 RX");
+	}
 }
 
 static void send_frame(uint8_t cmd, const void *payload, uint8_t len)
@@ -115,6 +141,8 @@ static void send_frame(uint8_t cmd, const void *payload, uint8_t len)
 		memcpy(&out[n], payload, len);
 		n += len;
 	}
+
+	LOG_HEXDUMP_INF(out, n, "uart1 TX");
 
 	for (size_t i = 0; i < n; i++) {
 		uart_poll_out(uart_dev, out[i]);
@@ -147,6 +175,23 @@ static void handle_pair(void)
 	send_simple_response(NUKI_UART_CMD_PAIR, err);
 }
 
+static void fill_state_fields(struct nuki_uart_resp_state *resp,
+			       const struct nuki_keyturner_state *state, int32_t age_sec)
+{
+	resp->lock_state = state->lock_state;
+	resp->battery_percent = state->battery_percent;
+	resp->critical_battery = state->critical_battery ? 1 : 0;
+	resp->door_sensor_state = state->door_sensor_state;
+	resp->year = state->year;
+	resp->month = state->month;
+	resp->day = state->day;
+	resp->hour = state->hour;
+	resp->minute = state->minute;
+	resp->second = state->second;
+	resp->timezone_offset_min = state->timezone_offset_min;
+	resp->age_sec = age_sec;
+}
+
 static void handle_state(void)
 {
 	struct nuki_uart_resp_state resp = {0};
@@ -160,27 +205,32 @@ static void handle_state(void)
 
 	resp.rc = err;
 	if (!err) {
-		resp.lock_state = state.lock_state;
-		resp.battery_percent = state.battery_percent;
-		resp.critical_battery = state.critical_battery ? 1 : 0;
-		resp.door_sensor_state = state.door_sensor_state;
-		resp.year = state.year;
-		resp.month = state.month;
-		resp.day = state.day;
-		resp.hour = state.hour;
-		resp.minute = state.minute;
-		resp.second = state.second;
-		resp.timezone_offset_min = state.timezone_offset_min;
-		resp.age_sec = age_sec;
+		fill_state_fields(&resp, &state, age_sec);
 	}
 	send_frame(NUKI_UART_CMD_STATE, &resp, sizeof(resp));
 }
 
 static void handle_lock_action(uint8_t action, uint8_t cmd)
 {
+	struct nuki_uart_resp_state resp = {0};
+	struct nuki_keyturner_state state;
+	int32_t age_sec;
 	int err = nuki_app_lock_action(action);
 
-	send_simple_response(cmd, err);
+	resp.rc = err;
+	if (!err) {
+		/* nuki_app_lock_action() updates the cache from the lock's own
+		 * post-action state push whenever it gets one (see nuki_app.c),
+		 * so this is usually the fresh result of the action just
+		 * performed (AGE_S near 0) rather than a stale earlier poll -
+		 * report it here so Loxone doesn't need a separate STATE
+		 * request right after LOCK/UNLOCK/UNLATCH.
+		 */
+		if (nuki_app_get_cached_state(&state, &age_sec) == 0) {
+			fill_state_fields(&resp, &state, age_sec);
+		}
+	}
+	send_frame(cmd, &resp, sizeof(resp));
 }
 
 static void handle_calibrate(const struct rx_frame *frame)

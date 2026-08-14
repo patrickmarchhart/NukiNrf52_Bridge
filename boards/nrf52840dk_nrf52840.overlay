@@ -1,44 +1,37 @@
 /*
  * Enables the DK's second UART (uart1) for the Loxone module machine
- * protocol (see nuki_uart_proto.c), using custom pinctrl instead of the
- * board's default "Arduino Serial" pins (P1.01/P1.02) - these were chosen
- * to match the pinout planned for the final custom Loxone-module PCB
- * (nRF52840 module), which doesn't use those pins. Neither pin has the
- * datasheet's "low frequency I/O only" restriction (unlike e.g. P0.29/
- * P0.31), so they're suitable for UART at normal baud rates.
+ * protocol (see nuki_uart_proto.c).
  *
- *   P0.20 = TX (board transmits) -> wire to the Loxone module's RX
- *   P0.22 = RX (board receives)  -> wire to the Loxone module's TX
+ * Uses the board's own default "Arduino Serial" pins for uart1 - P1.01 (RX)
+ * and P1.02 (TX) - instead of custom pinctrl. An earlier revision of this
+ * overlay moved uart1 to P0.20/P0.22 (planned to match the final custom
+ * Loxone-module PCB's pinout), but those turned out to be hard-wired on the
+ * DK to the onboard QSPI flash chip's IO0/IO2 lines (P0.17/19-23), which
+ * caused unreliable/no communication on uart1. P1.01/P1.02 aren't connected
+ * to any onboard peripheral, so switched back to them for reliable testing
+ * on this DK - the final custom PCB (no onboard QSPI flash) can use whatever
+ * pins fit its own layout without this constraint.
+ *
+ *   P1.02 = TX (board transmits) -> wire to the Loxone module's RX
+ *   P1.01 = RX (board receives)  -> wire to the Loxone module's TX
  * plus a common GND between the two boards.
  *
- * On the nRF52840 DK itself, P0.20/P0.22 are broken out on the "P0" GPIO
- * header (pins labelled 20 and 22) - not the Arduino shield connector.
+ * On the nRF52840 DK itself, P1.01/P1.02 are broken out on the Arduino
+ * shield connector as D0/D1.
  */
-
-&pinctrl {
-	uart1_default: uart1_default {
-		group1 {
-			psels = <NRF_PSEL(UART_TX, 0, 20)>;
-		};
-		group2 {
-			psels = <NRF_PSEL(UART_RX, 0, 22)>;
-			bias-pull-up;
-		};
-	};
-
-	uart1_sleep: uart1_sleep {
-		group1 {
-			psels = <NRF_PSEL(UART_TX, 0, 20)>,
-				<NRF_PSEL(UART_RX, 0, 22)>;
-			low-power-enable;
-		};
-	};
-};
 
 &uart1 {
 	status = "okay";
 	current-speed = <115200>;
-	pinctrl-0 = <&uart1_default>;
-	pinctrl-1 = <&uart1_sleep>;
-	pinctrl-names = "default", "sleep";
+};
+
+/*
+ * The DK's onboard QSPI flash chip (MX25R6435F) is hard-wired to P0.17/19-23.
+ * This project doesn't use the external flash (settings/NVS use internal
+ * flash), so disable the QSPI peripheral - harmless either way now that
+ * uart1 no longer shares any of those pins, but no reason to leave an
+ * unused peripheral active.
+ */
+&qspi {
+	status = "disabled";
 };

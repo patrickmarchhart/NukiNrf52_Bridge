@@ -163,11 +163,18 @@ static int request_challenge(struct nuki_transport *usdio, uint32_t auth_id,
 }
 
 /* Drains responses (Status ACCEPTED, KeyturnerStates updates...) until a
- * terminal Status COMPLETE or an ErrorReport arrives.
+ * terminal Status COMPLETE or an ErrorReport arrives. If state_out/got_state
+ * are non-NULL, best-effort captures the first KeyturnerStates update seen
+ * along the way (see nuki_command_lock_action()).
  */
 static int drain_until_complete(struct nuki_transport *usdio,
-				 const uint8_t shared_key[NUKI_KEY_LEN])
+				 const uint8_t shared_key[NUKI_KEY_LEN],
+				 struct nuki_keyturner_state *state_out, bool *got_state)
 {
+	if (got_state) {
+		*got_state = false;
+	}
+
 	for (int i = 0; i < 10; i++) {
 		uint8_t payload[MAX_PLAINTEXT];
 		size_t payload_len;
@@ -195,8 +202,19 @@ static int drain_until_complete(struct nuki_transport *usdio,
 			continue;
 		}
 
-		/* KeyturnerStates or other intermediate updates: ignore and
-		 * keep waiting for the terminal Status.
+		if (cmd == NUKI_CMD_KEYTURNER_STATES && state_out && got_state) {
+			/* A parse failure here isn't fatal to the overall
+			 * operation - it just means the caller won't get this
+			 * bonus data and will fall back to its existing cache.
+			 */
+			if (nuki_keyturner_state_parse(state_out, payload, payload_len) == 0) {
+				*got_state = true;
+			}
+			continue;
+		}
+
+		/* Other intermediate updates: ignore and keep waiting for the
+		 * terminal Status.
 		 */
 	}
 
@@ -205,7 +223,8 @@ static int drain_until_complete(struct nuki_transport *usdio,
 }
 
 int nuki_command_lock_action(struct nuki_transport *usdio, uint32_t auth_id, uint32_t app_id,
-			      const uint8_t shared_key[NUKI_KEY_LEN], uint8_t action)
+			      const uint8_t shared_key[NUKI_KEY_LEN], uint8_t action,
+			      struct nuki_keyturner_state *state_out, bool *got_state)
 {
 	uint8_t nonce_k[32];
 	uint8_t action_payload[1 + 4 + 1 + 32];
@@ -228,7 +247,7 @@ int nuki_command_lock_action(struct nuki_transport *usdio, uint32_t auth_id, uin
 		return err;
 	}
 
-	return drain_until_complete(usdio, shared_key);
+	return drain_until_complete(usdio, shared_key, state_out, got_state);
 }
 
 int nuki_command_calibrate(struct nuki_transport *usdio, uint32_t auth_id,
@@ -253,5 +272,5 @@ int nuki_command_calibrate(struct nuki_transport *usdio, uint32_t auth_id,
 		return err;
 	}
 
-	return drain_until_complete(usdio, shared_key);
+	return drain_until_complete(usdio, shared_key, NULL, NULL);
 }

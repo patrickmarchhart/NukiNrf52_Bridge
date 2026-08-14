@@ -683,6 +683,8 @@ static int get_state_locked(struct nuki_keyturner_state *out)
 static int lock_action_locked(uint8_t action)
 {
 	const struct nuki_pairing_data *p = nuki_storage_get_pairing();
+	struct nuki_keyturner_state state;
+	bool got_state;
 	int err;
 
 	if (!p) {
@@ -694,8 +696,25 @@ static int lock_action_locked(uint8_t action)
 		return err;
 	}
 
-	err = nuki_command_lock_action(&g_usdio, p->auth_id, p->app_id, p->shared_key, action);
+	err = nuki_command_lock_action(&g_usdio, p->auth_id, p->app_id, p->shared_key, action,
+					&state, &got_state);
 	disconnect_from_lock();
+
+	/* The lock conveniently pushes its post-action state as part of the
+	 * action sequence (see nuki_command_lock_action()) - update the cache
+	 * from it right away instead of waiting for the next background poll,
+	 * at no extra BLE cost since we're already connected for the action
+	 * anyway.
+	 */
+	if (!err && got_state) {
+		k_mutex_lock(&g_cache_lock, K_FOREVER);
+		g_cached_state = state;
+		g_cache_valid = true;
+		g_cache_uptime_ms = k_uptime_get();
+		k_mutex_unlock(&g_cache_lock);
+		LOG_INF("cache updated from lock-action response");
+	}
+
 	return err;
 }
 

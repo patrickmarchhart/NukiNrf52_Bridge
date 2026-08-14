@@ -64,13 +64,19 @@ struct nuki_uart_resp_status {
 	uint8_t ready;
 } __packed;
 
-/* Response to PAIR, LOCK, UNLOCK, UNLATCH and CALIBRATE - the result carries
- * no data beyond success/failure.
+/* Response to PAIR and CALIBRATE - the result carries no data beyond
+ * success/failure.
  */
 struct nuki_uart_resp_simple {
 	int32_t rc;
 } __packed;
 
+/* Also the response to LOCK, UNLOCK and UNLATCH: the lock conveniently
+ * pushes its post-action state as part of those commands (see
+ * nuki_command_lock_action()), so the state fields are usually the fresh
+ * result of the action just performed (age_sec near 0) rather than requiring
+ * a separate STATE request afterwards - see nuki_app.c/nuki_uart_proto.c.
+ */
 struct nuki_uart_resp_state {
 	int32_t rc;
 	uint8_t lock_state;

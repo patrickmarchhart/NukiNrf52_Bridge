@@ -13,13 +13,18 @@ C-Struct-Definitionen).
 
 ## 1. Hardware / Verkabelung
 
-| Signal | Pin (nRF52840) | Richtung             |
-|--------|-----------------|----------------------|
-| TX     | P0.20           | Board → Loxone (RX)  |
-| RX     | P0.22           | Loxone (TX) → Board  |
-| GND    | –               | gemeinsame Masse     |
+| Signal | Pin (nRF52840 DK) | Richtung             |
+|--------|--------------------|----------------------|
+| TX     | P1.02 (Arduino-Header D1) | Board → Loxone (RX)  |
+| RX     | P1.01 (Arduino-Header D0) | Loxone (TX) → Board  |
+| GND    | –                  | gemeinsame Masse     |
 
-Pinbelegung siehe [`boards/nrf52840dk_nrf52840.overlay`](boards/nrf52840dk_nrf52840.overlay).
+Das sind die Board-eigenen "Arduino Serial"-Standardpins der DK (kein
+eigenes Pinctrl-Overlay mehr nötig). Eine frühere Revision nutzte stattdessen
+P0.20/P0.22 - die sind auf der DK aber hart mit dem Onboard-QSPI-Flash-Chip
+(IO0/IO2) verdrahtet, was zu unzuverlässiger/keiner Kommunikation führte;
+P1.01/P1.02 hängen an keiner Onboard-Peripherie. Pinbelegung siehe
+[`boards/nrf52840dk_nrf52840.overlay`](boards/nrf52840dk_nrf52840.overlay).
 
 **UART-Parameter:** 115200 Baud, 8 Datenbits, kein Paritätsbit, 1 Stoppbit,
 keine Flusskontrolle (8N1). Die Baudrate ist über `current-speed` im Overlay
@@ -70,9 +75,9 @@ Es gibt kein asynchrones Push von Statusänderungen — Loxone fragt aktiv ab
 | `1`   | `STATUS`    | Pairing-/Verbindungsstatus, ohne BLE-Zugriff | keins | `nuki_uart_resp_status` (7 B) |
 | `2`   | `PAIR`      | Pairing mit dem Schloss durchführen | keins | `nuki_uart_resp_simple` (4 B) |
 | `3`   | `STATE`     | Zwischengespeicherten Schlosszustand lesen (sofortige Antwort) | keins | `nuki_uart_resp_state` (21 B) |
-| `4`   | `LOCK`      | Tür verschließen | keins | `nuki_uart_resp_simple` (4 B) |
-| `5`   | `UNLOCK`    | Tür entriegeln | keins | `nuki_uart_resp_simple` (4 B) |
-| `6`   | `UNLATCH`   | Tür entriegeln und öffnen (Falle) | keins | `nuki_uart_resp_simple` (4 B) |
+| `4`   | `LOCK`      | Tür verschließen | keins | `nuki_uart_resp_state` (21 B) |
+| `5`   | `UNLOCK`    | Tür entriegeln | keins | `nuki_uart_resp_state` (21 B) |
+| `6`   | `UNLATCH`   | Tür entriegeln und öffnen (Falle) | keins | `nuki_uart_resp_state` (21 B) |
 | `7`   | `CALIBRATE` | Kalibrierung (voller Motorlauf) starten | `nuki_uart_req_calibrate` (2 B) | `nuki_uart_resp_simple` (4 B) |
 
 Details zu jedem Befehl (inkl. Byte-Layout der Structs) folgen unten.
@@ -170,39 +175,48 @@ Antwort (`rc=0`, `lock_state=3` unlocked, `battery=87%`, `year=2026`,
 
 ### `4` — LOCK / `5` — UNLOCK / `6` — UNLATCH
 Führt die jeweilige Schließaktion aus (eigene kurzzeitige BLE-Verbindung,
-1-3 Sekunden). Request: kein Payload. Response: `struct nuki_uart_resp_simple`
-(nur `rc`).
+1-3 Sekunden).
+
+Request: kein Payload. Response — `struct nuki_uart_resp_state` (21 Byte,
+gleiches Layout wie bei `STATE`, Abschnitt `3`): Der Nuki-Lock schickt seine
+Zustandsänderung schon während der Aktion selbst mit (ohne zusätzlichen
+BLE-Roundtrip), daher liefert die Antwort direkt den frischen Zustand nach
+der Aktion mit — `AGE_S` liegt dabei üblicherweise nahe `0`. Das erspart
+Loxone eine separate `STATE`-Anfrage direkt nach `LOCK`/`UNLOCK`/`UNLATCH`.
+Bei einem Fehlschlag (`rc != 0`) sind die Zustandsfelder wie üblich 0 und
+ohne Bedeutung.
 
 Beispiel `LOCK` (`CMD=4`) — Request:
 ```
 A5 04 00
 ```
-Antwort bei Erfolg (`rc=0`):
+Antwort bei Erfolg (`rc=0`, `lock_state=1` locked, `battery=87%`,
+`door_state=2` closed, `age_sec=0`):
 ```
-5A 04 04 00 00 00 00
+5A 04 15 00 00 00 00 01 57 00 02 EA 07 08 0E 14 05 1E 00 00 00 00 00 00
 ```
 Antwort bei Fehler, z. B. nicht gepairt (`rc=-2`) — Fehlerantworten sehen bei
-allen Befehlen gleich aus, nur `CMD` und `rc` ändern sich:
+allen Befehlen gleich aus, nur `CMD` und `rc` ändern sich (Zustandsfelder = 0):
 ```
-5A 04 04 FE FF FF FF
+5A 04 15 FE FF FF FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
 Beispiel `UNLOCK` (`CMD=5`) — Request:
 ```
 A5 05 00
 ```
-Antwort (`rc=0`):
+Antwort bei Erfolg (`rc=0`, hier gekürzt dargestellt - Struktur wie oben):
 ```
-5A 05 04 00 00 00 00
+5A 05 15 00 00 00 00 03 57 00 02 EA 07 08 0E 14 05 1E 00 00 00 00 00 00
 ```
 
 Beispiel `UNLATCH` (`CMD=6`) — Request:
 ```
 A5 06 00
 ```
-Antwort (`rc=0`):
+Antwort bei Erfolg (`rc=0`, hier gekürzt dargestellt - Struktur wie oben):
 ```
-5A 06 04 00 00 00 00
+5A 06 15 00 00 00 00 05 57 00 03 EA 07 08 0E 14 05 1E 00 00 00 00 00 00
 ```
 
 ### `7` — CALIBRATE
