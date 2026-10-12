@@ -1,0 +1,51 @@
+/*
+ * Enables uart1 with custom pinctrl for the Loxone module machine protocol
+ * (see nuki_uart_proto.c), on P1.01 (RX) / P1.02 (TX) - the same physical
+ * nRF52840 pins used for uart1 on the nRF52840 DK
+ * (boards/nrf52840dk_nrf52840.overlay), so both boards are wired identically
+ * for the Loxone module regardless of which one is used.
+ *
+ * uart1 isn't touched by this board's own default devicetree (only uart0,
+ * on P0.09/P0.10, is - used here for nothing since the console/shell runs
+ * over USB CDC-ACM instead, see promicro_nrf52840_nrf52840_common.dts), and
+ * P1.01/P1.02 aren't claimed by i2c0/i2c1/spi2/pwm0 either, so there's no
+ * pin conflict enabling uart1 here.
+ *
+ *   P1.02 = TX (board transmits) -> wire to the Loxone module's RX
+ *   P1.01 = RX (board receives)  -> wire to the Loxone module's TX
+ * plus a common GND between the two boards.
+ */
+
+&pinctrl {
+	uart1_default: uart1_default {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 1, 2)>;
+		};
+		group2 {
+			psels = <NRF_PSEL(UART_RX, 1, 1)>;
+			bias-pull-up;
+		};
+	};
+
+	uart1_sleep: uart1_sleep {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 1, 2)>,
+				<NRF_PSEL(UART_RX, 1, 1)>;
+			low-power-enable;
+		};
+	};
+};
+
+/ {
+	aliases {
+		loxone-uart = &uart1;
+	};
+};
+
+&uart1 {
+	status = "okay";
+	current-speed = <115200>;
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-1 = <&uart1_sleep>;
+	pinctrl-names = "default", "sleep";
+};

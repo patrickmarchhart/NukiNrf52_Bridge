@@ -29,7 +29,17 @@
 
 LOG_MODULE_REGISTER(nuki_uart_proto, LOG_LEVEL_INF);
 
-#define NUKI_UART_NODE DT_NODELABEL(uart1)
+/* Which physical UART carries the Loxone protocol is board-specific (e.g.
+ * uart1 on the nRF52840 DK, but uart0 on boards like the Pro Micro nRF52840
+ * where the console instead runs over USB CDC-ACM, freeing uart0's pins) -
+ * each board overlay defines a "loxone-uart" alias pointing at whichever
+ * UART node is actually free on that board, instead of hardcoding one here.
+ */
+#define NUKI_UART_NODE DT_ALIAS(loxone_uart)
+
+#if !DT_NODE_EXISTS(NUKI_UART_NODE)
+#error "No 'loxone-uart' alias defined for this board - add one to its overlay (see boards/nrf52840dk_nrf52840.overlay)."
+#endif
 /* Must be large enough for the same call chain the shell uses for lock
  * actions (connect_to_lock() -> GATT discovery -> encrypt/decrypt the
  * response) - the shell needed CONFIG_SHELL_STACK_SIZE=4096 for exactly

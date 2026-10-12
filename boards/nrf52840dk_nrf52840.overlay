@@ -20,6 +20,12 @@
  * shield connector as D0/D1.
  */
 
+/ {
+	aliases {
+		loxone-uart = &uart1;
+	};
+};
+
 &uart1 {
 	status = "okay";
 	current-speed = <115200>;

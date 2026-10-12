@@ -93,7 +93,18 @@ static struct k_mutex g_op_lock;
  */
 #define STATE_POLL_RETRY_SEC 3
 #define STATE_POLL_MAX_RETRIES 3
-#define STATE_POLL_THREAD_STACK_SIZE 2048
+/* Must match the uart1 protocol thread's stack size (see
+ * THREAD_STACK_SIZE in nuki_uart_proto.c) - this thread runs the exact same
+ * deep call chain (connect_to_lock() -> GATT discovery -> encrypt/decrypt)
+ * via nuki_app_get_state(). 2048 was enough to never crash in quick manual
+ * testing, but overflowed intermittently here over long unattended runtime
+ * (same class of bug that was first caught on the uart1 thread during a
+ * LOCK test) - a stack overflow halts the whole system (no watchdog/auto-
+ * reboot configured), and since it happens while g_op_lock is held, every
+ * other caller (shell, uart1) then blocks forever waiting for that mutex
+ * too, looking exactly like "the firmware hangs and uart1 stops responding".
+ */
+#define STATE_POLL_THREAD_STACK_SIZE 4096
 #define STATE_POLL_THREAD_PRIORITY 7
 
 /* Runs on its own dedicated thread rather than the system workqueue: the
